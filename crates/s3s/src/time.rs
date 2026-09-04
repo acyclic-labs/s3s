@@ -1,14 +1,35 @@
 use std::fmt;
 
-pub fn now_utc() -> impl fmt::Debug {
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        time::OffsetDateTime::now_utc()
+/// Supplies wall-clock time for request authentication and policy validation.
+///
+/// Returning `None` makes time-dependent request processing fail closed. Services that do not
+/// install a clock use [`SystemClock`].
+pub trait Clock: Send + Sync + 'static {
+    /// Returns the current UTC time, or `None` when authoritative time is unavailable.
+    fn now_utc(&self) -> Option<time::OffsetDateTime>;
+}
+
+/// The default clock backed by the host wall clock.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now_utc(&self) -> Option<time::OffsetDateTime> {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            Some(time::OffsetDateTime::now_utc())
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            None
+        }
     }
-    #[cfg(target_arch = "wasm32")]
-    {
-        ()
-    }
+}
+
+pub(crate) fn require_now_utc(clock: &dyn Clock) -> crate::S3Result<time::OffsetDateTime> {
+    clock
+        .now_utc()
+        .ok_or_else(|| s3_error!(ServiceUnavailable, "server clock is unavailable"))
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -47,9 +68,23 @@ mod tests {
 
     #[test]
     fn test_now_utc() {
-        let t = now_utc();
+        let t = SystemClock.now_utc();
         // Ensure it returns something Debug-formattable
         let _ = format!("{t:?}");
+    }
+
+    #[test]
+    fn unavailable_clock_fails_closed() {
+        struct UnavailableClock;
+
+        impl Clock for UnavailableClock {
+            fn now_utc(&self) -> Option<time::OffsetDateTime> {
+                None
+            }
+        }
+
+        let err = require_now_utc(&UnavailableClock).expect_err("unavailable time must fail");
+        assert_eq!(*err.code(), crate::S3ErrorCode::ServiceUnavailable);
     }
 
     #[test]

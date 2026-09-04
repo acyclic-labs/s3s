@@ -62,6 +62,7 @@ fn extract_amz_date(hs: &'_ OrderedHeaders<'_>) -> S3Result<Option<AmzDate>> {
 pub struct SignatureContext<'a> {
     pub auth: Option<&'a dyn S3Auth>,
     pub config: &'a Arc<dyn S3ConfigProvider>,
+    pub clock: &'a dyn crate::Clock,
 
     pub req_version: ::http::Version,
     pub req_method: &'a Method,
@@ -250,7 +251,7 @@ impl SignatureContext<'_> {
 
         {
             // check expiration
-            let now = time::OffsetDateTime::now_utc();
+            let now = crate::time::require_now_utc(self.clock)?;
 
             let date = presigned_url
                 .amz_date
@@ -606,7 +607,7 @@ impl SignatureContext<'_> {
         let qs = self.qs.unwrap(); // assume: qs has "Signature"
         let presigned_url = PresignedUrlV2::parse(qs).map_err(|err| invalid_request!(err, "missing presigned url v2 fields"))?;
 
-        if time::OffsetDateTime::now_utc() > presigned_url.expires_time {
+        if crate::time::require_now_utc(self.clock)? > presigned_url.expires_time {
             return Err(s3_error!(AccessDenied, "Request has expired"));
         }
 
@@ -642,6 +643,116 @@ impl SignatureContext<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Clone, Copy)]
+    struct FixedClock(Option<time::OffsetDateTime>);
+
+    impl crate::Clock for FixedClock {
+        fn now_utc(&self) -> Option<time::OffsetDateTime> {
+            self.0
+        }
+    }
+
+    fn presigned_context<'a>(
+        clock: &'a dyn crate::Clock,
+        config: &'a Arc<dyn crate::config::S3ConfigProvider>,
+        qs: &'a OrderedQs,
+        method: &'a Method,
+        uri: &'a Uri,
+        body: &'a mut Body,
+    ) -> SignatureContext<'a> {
+        SignatureContext {
+            auth: None,
+            config,
+            clock,
+            req_version: ::http::Version::HTTP_11,
+            req_method: method,
+            req_uri: uri,
+            req_body: body,
+            qs: Some(qs),
+            hs: OrderedHeaders::from_slice_unchecked(&[]),
+            decoded_uri_path: uri.path().to_owned(),
+            vh_bucket: None,
+            content_length: None,
+            mime: None,
+            decoded_content_length: None,
+            transformed_body: None,
+            multipart: None,
+            trailing_headers: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn presigned_v4_uses_injected_clock_and_fails_closed() {
+        let qs = OrderedQs::parse(concat!(
+            "X-Amz-Algorithm=AWS4-HMAC-SHA256",
+            "&X-Amz-Credential=AKID%2F20240101%2Fus-east-1%2Fs3%2Faws4_request",
+            "&X-Amz-Date=20240101T000000Z",
+            "&X-Amz-Expires=60",
+            "&X-Amz-SignedHeaders=host",
+            "&X-Amz-Signature=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ))
+        .unwrap();
+        let config: Arc<dyn crate::config::S3ConfigProvider> = Arc::new(crate::config::StaticConfigProvider::default());
+        let method = Method::GET;
+        let uri = Uri::from_static("https://s3.amazonaws.com/object");
+
+        let expired_clock = FixedClock(time::OffsetDateTime::from_unix_timestamp(1_704_067_261).ok());
+        let mut expired_body = Body::empty();
+        let mut expired = presigned_context(&expired_clock, &config, &qs, &method, &uri, &mut expired_body);
+        let err = expired.v4_check_presigned_url().await.expect_err("request must be expired");
+        assert_eq!(err.code(), &crate::S3ErrorCode::AccessDenied);
+
+        let unavailable_clock = FixedClock(None);
+        let mut unavailable_body = Body::empty();
+        let mut unavailable = presigned_context(&unavailable_clock, &config, &qs, &method, &uri, &mut unavailable_body);
+        let err = unavailable
+            .v4_check_presigned_url()
+            .await
+            .expect_err("unavailable time must fail closed");
+        assert_eq!(err.code(), &crate::S3ErrorCode::ServiceUnavailable);
+
+        let future_clock = FixedClock(time::OffsetDateTime::from_unix_timestamp(1_704_066_299).ok());
+        let mut future_body = Body::empty();
+        let mut future = presigned_context(&future_clock, &config, &qs, &method, &uri, &mut future_body);
+        let err = future
+            .v4_check_presigned_url()
+            .await
+            .expect_err("request too far in the future must be rejected");
+        assert_eq!(err.code(), &crate::S3ErrorCode::RequestTimeTooSkewed);
+
+        let valid_clock = FixedClock(time::OffsetDateTime::from_unix_timestamp(1_704_067_230).ok());
+        let mut valid_body = Body::empty();
+        let mut valid = presigned_context(&valid_clock, &config, &qs, &method, &uri, &mut valid_body);
+        let err = valid
+            .v4_check_presigned_url()
+            .await
+            .expect_err("missing auth follows a valid time decision");
+        assert_eq!(err.code(), &crate::S3ErrorCode::NotImplemented);
+    }
+
+    #[tokio::test]
+    async fn presigned_v2_uses_injected_clock() {
+        let qs = OrderedQs::parse("AWSAccessKeyId=AKID&Expires=1704067200&Signature=unused").unwrap();
+        let config: Arc<dyn crate::config::S3ConfigProvider> = Arc::new(crate::config::StaticConfigProvider::default());
+        let method = Method::GET;
+        let uri = Uri::from_static("https://s3.amazonaws.com/object");
+        let clock = FixedClock(time::OffsetDateTime::from_unix_timestamp(1_704_067_201).ok());
+        let mut body = Body::empty();
+        let mut cx = presigned_context(&clock, &config, &qs, &method, &uri, &mut body);
+
+        let err = cx.v2_check_presigned_url().await.expect_err("request must be expired");
+        assert_eq!(err.code(), &crate::S3ErrorCode::AccessDenied);
+
+        let valid_clock = FixedClock(time::OffsetDateTime::from_unix_timestamp(1_704_067_199).ok());
+        let mut valid_body = Body::empty();
+        let mut valid = presigned_context(&valid_clock, &config, &qs, &method, &uri, &mut valid_body);
+        let err = valid
+            .v2_check_presigned_url()
+            .await
+            .expect_err("missing auth follows a valid time decision");
+        assert_eq!(err.code(), &crate::S3ErrorCode::NotImplemented);
+    }
 
     #[test]
     fn test_extract_amz_content_sha256_missing() {
@@ -705,6 +816,7 @@ file content\r\n\
         let mut cx = SignatureContext {
             auth: None,
             config: &config,
+            clock: &crate::SystemClock,
             req_version: ::http::Version::HTTP_11,
             req_method: &method,
             req_uri: &uri,
@@ -826,6 +938,7 @@ file content\r\n\
         let mut cx = SignatureContext {
             auth: Some(&auth),
             config: &config,
+            clock: &crate::SystemClock,
             req_version: ::http::Version::HTTP_11,
             req_method: &method,
             req_uri: &uri,
@@ -890,6 +1003,7 @@ file content\r\n\
         let mut cx = SignatureContext {
             auth: Some(&auth),
             config: &config,
+            clock: &crate::SystemClock,
             req_version: ::http::Version::HTTP_11,
             req_method: &method,
             req_uri: &uri,

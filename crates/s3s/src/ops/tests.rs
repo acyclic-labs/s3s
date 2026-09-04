@@ -59,6 +59,7 @@ async fn anonymous_request_clears_region_and_service() {
         access: None,
         route: None,
         validation: None,
+        clock: &crate::SystemClock,
     };
 
     let mut req = Request::from(
@@ -117,6 +118,7 @@ async fn vh_region_fallback_for_anonymous_request() {
         access: None,
         route: None,
         validation: None,
+        clock: &crate::SystemClock,
     };
 
     // Virtual-hosted style request: Host header "bucket.example.com", path is the key.
@@ -261,6 +263,7 @@ async fn presigned_url_expires_0_should_be_expired() {
     let mut cx = SignatureContext {
         auth: None,
         config: &config,
+        clock: &crate::SystemClock,
         req_version: ::http::Version::HTTP_11,
         req_method: &method,
         req_uri: &uri,
@@ -294,7 +297,6 @@ async fn post_multipart_bucket_routes_to_post_object() {
     use crate::sig_v4;
     use bytes::Bytes;
     use hyper::Method;
-    use hyper::header::HeaderValue;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -341,6 +343,7 @@ async fn post_multipart_bucket_routes_to_post_object() {
         access: None,
         route: None,
         validation: None,
+        clock: &crate::SystemClock,
     };
 
     // Build a minimal multipart/form-data POST object request.
@@ -402,7 +405,7 @@ async fn post_multipart_bucket_routes_to_post_object() {
             .header(crate::header::HOST, "localhost")
             .header(
                 crate::header::CONTENT_TYPE,
-                HeaderValue::from_str(&format!("multipart/form-data; boundary={boundary}")).unwrap(),
+                hyper::header::HeaderValue::from_str(&format!("multipart/form-data; boundary={boundary}")).unwrap(),
             )
             .body(Body::from(Bytes::from(body)))
             .unwrap(),
@@ -478,6 +481,7 @@ mod post_policy_test_helpers {
             access: None,
             route: None,
             validation: None,
+            clock: &crate::SystemClock,
         }
     }
 
@@ -643,6 +647,74 @@ mod post_policy_test_helpers {
                 .unwrap(),
         )
     }
+}
+
+#[tokio::test]
+async fn post_policy_fails_closed_when_injected_clock_is_unavailable() {
+    use crate::auth::SecretKey;
+    use std::sync::Arc;
+
+    struct UnavailableClock;
+
+    impl crate::Clock for UnavailableClock {
+        fn now_utc(&self) -> Option<time::OffsetDateTime> {
+            None
+        }
+    }
+
+    let s3: Arc<dyn crate::s3_trait::S3> = Arc::new(post_policy_test_helpers::TestS3NoOp);
+    let config = post_policy_test_helpers::create_test_config(1024);
+    let auth = post_policy_test_helpers::create_test_auth();
+    let mut ccx = post_policy_test_helpers::create_test_context(&s3, &config, &auth);
+    ccx.clock = &UnavailableClock;
+    let secret_key: SecretKey = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".into();
+    let policy_json = format!(
+        r#"{{"expiration":"2030-01-01T00:00:00.000Z","conditions":[{}]}}"#,
+        post_policy_test_helpers::BASE_CONDITIONS,
+    );
+    let mut req = post_policy_test_helpers::build_post_object_request(&policy_json, "body", &secret_key, false);
+
+    let Err(err) = super::prepare(&mut req, &ccx).await else {
+        panic!("unavailable time must reject a policy-bearing request");
+    };
+    assert_eq!(err.code(), &crate::S3ErrorCode::ServiceUnavailable);
+}
+
+#[tokio::test]
+async fn policy_less_post_does_not_require_wall_clock() {
+    use std::sync::Arc;
+
+    struct UnavailableClock;
+
+    impl crate::Clock for UnavailableClock {
+        fn now_utc(&self) -> Option<time::OffsetDateTime> {
+            None
+        }
+    }
+
+    let s3: Arc<dyn crate::s3_trait::S3> = Arc::new(post_policy_test_helpers::TestS3NoOp);
+    let config = post_policy_test_helpers::create_test_config(1024);
+    let auth = post_policy_test_helpers::create_test_auth();
+    let mut ccx = post_policy_test_helpers::create_test_context(&s3, &config, &auth);
+    ccx.auth = None;
+    ccx.clock = &UnavailableClock;
+    let boundary = "------------------------policyless";
+    let body = post_policy_test_helpers::build_multipart_fields(&[("key", "test-key")], boundary)
+        + &post_policy_test_helpers::build_multipart_file_field("file", "test.txt", "text/plain", "body", boundary);
+    let mut req = Request::from(
+        hyper::Request::builder()
+            .method(Method::POST)
+            .uri("http://localhost/test-bucket")
+            .header(crate::header::HOST, "localhost")
+            .header(
+                crate::header::CONTENT_TYPE,
+                hyper::header::HeaderValue::from_str(&format!("multipart/form-data; boundary={boundary}")).unwrap(),
+            )
+            .body(Body::from(Bytes::from(body)))
+            .unwrap(),
+    );
+
+    assert!(super::prepare(&mut req, &ccx).await.is_ok());
 }
 
 /// Test that policy max < config max results in using policy max for file size limit
@@ -922,6 +994,7 @@ async fn test_s3_route_anonymous_access_denied() {
         access: None,
         route: None,
         validation: None,
+        clock: &crate::SystemClock,
     };
 
     // Create an anonymous GET object request (no auth headers or query params)
@@ -986,6 +1059,7 @@ async fn test_s3_route_custom_access_allows_anonymous() {
         access: Some(&anonymous_access),
         route: None,
         validation: None,
+        clock: &crate::SystemClock,
     };
 
     // Create an anonymous GET object request
@@ -1095,6 +1169,7 @@ async fn test_custom_route_anonymous_access_denied() {
         access: None,
         route: Some(&custom_route),
         validation: None,
+        clock: &crate::SystemClock,
     };
 
     // Create an anonymous request to the custom route
@@ -1210,6 +1285,7 @@ async fn test_custom_route_anonymous_access_allowed_when_overridden() {
         access: None,
         route: Some(&anonymous_route),
         validation: None,
+        clock: &crate::SystemClock,
     };
 
     // Create an anonymous request to the public route
@@ -1270,6 +1346,7 @@ async fn test_s3_route_no_auth_provider_allows_unsigned_requests() {
         access: None,
         route: None,
         validation: None,
+        clock: &crate::SystemClock,
     };
 
     // Create an unsigned request
@@ -1380,6 +1457,7 @@ async fn test_custom_route_override_check_access_allows_unsigned_requests() {
         access: None,
         route: Some(&test_route),
         validation: None,
+        clock: &crate::SystemClock,
     };
 
     // Create an unsigned request to the custom route
@@ -1489,6 +1567,7 @@ async fn test_custom_route_default_check_access_denies_unsigned_without_auth_pro
         access: None,
         route: Some(&test_route),
         validation: None,
+        clock: &crate::SystemClock,
     };
 
     // Create an unsigned request to the custom route

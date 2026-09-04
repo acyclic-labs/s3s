@@ -69,6 +69,7 @@ pub struct CallContext<'a> {
     pub access: Option<&'a dyn S3Access>,
     pub route: Option<&'a dyn S3Route>,
     pub validation: Option<&'a dyn NameValidation>,
+    pub clock: &'a dyn crate::Clock,
 }
 
 fn build_s3_request<T>(input: T, req: &mut Request) -> S3Request<T> {
@@ -340,6 +341,7 @@ async fn prepare(req: &mut Request, ccx: &CallContext<'_>) -> S3Result<Prepare> 
             let mut scx = SignatureContext {
                 auth: ccx.auth,
                 config: ccx.config,
+                clock: ccx.clock,
 
                 req_version: req.version,
                 req_method: &req.method,
@@ -454,8 +456,8 @@ async fn prepare(req: &mut Request, ccx: &CallContext<'_>) -> S3Result<Prepare> 
 
                     // Parse POST policy BEFORE reading file stream to prevent resource exhaustion
                     // See https://docs.aws.amazon.com/AmazonS3/latest/API/sigv4-HTTPPOSTConstructPolicy.html
-                    let now = time::OffsetDateTime::now_utc();
                     let policy = if let Some(policy_b64) = multipart.find_field_value("policy") {
+                        let now = crate::time::require_now_utc(ccx.clock)?;
                         let policy = PostPolicy::from_base64(policy_b64)
                             .map_err(|e| s3_error!(e, InvalidPolicyDocument, "failed to parse POST policy"))?;
 

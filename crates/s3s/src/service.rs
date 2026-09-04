@@ -125,6 +125,7 @@ pub struct S3ServiceBuilder {
     access: Option<Box<dyn S3Access>>,
     route: Option<Box<dyn S3Route>>,
     validation: Option<Box<dyn NameValidation>>,
+    clock: Arc<dyn crate::Clock>,
 }
 
 impl S3ServiceBuilder {
@@ -162,6 +163,7 @@ impl S3ServiceBuilder {
             access: None,
             route: None,
             validation: None,
+            clock: Arc::new(crate::SystemClock),
         }
     }
 
@@ -410,6 +412,13 @@ impl S3ServiceBuilder {
         self.validation = Some(Box::new(validation));
     }
 
+    /// Sets the clock used for request authentication and policy expiration checks.
+    ///
+    /// A clock may return no time to make time-dependent requests fail closed.
+    pub fn set_clock(&mut self, clock: impl crate::Clock) {
+        self.clock = Arc::new(clock);
+    }
+
     /// Builds the [`S3Service`] from this builder.
     ///
     /// This consumes the builder and returns the configured service ready to handle requests.
@@ -446,6 +455,7 @@ impl S3ServiceBuilder {
                 access: self.access,
                 route: self.route,
                 validation: self.validation,
+                clock: self.clock,
             }),
         }
     }
@@ -550,6 +560,7 @@ struct Inner {
     access: Option<Box<dyn S3Access>>,
     route: Option<Box<dyn S3Route>>,
     validation: Option<Box<dyn NameValidation>>,
+    clock: Arc<dyn crate::Clock>,
 }
 
 impl S3Service {
@@ -609,7 +620,7 @@ impl S3Service {
     #[tracing::instrument(
         level = "debug",
         skip(self, req),
-        fields(start_time=?crate::time::now_utc())
+        fields(start_time=?self.inner.clock.now_utc())
     )]
     pub async fn call(&self, req: HttpRequest) -> Result<HttpResponse, HttpError> {
         debug!(?req);
@@ -626,6 +637,7 @@ impl S3Service {
             access: self.inner.access.as_deref(),
             route: self.inner.route.as_deref(),
             validation: self.inner.validation.as_deref(),
+            clock: self.inner.clock.as_ref(),
         };
         let result = match crate::ops::call(&mut req, &ccx).await {
             Ok(resp) => Ok(HttpResponse::from(resp)),
@@ -815,6 +827,57 @@ mod tests {
         let config = service.inner.config.snapshot();
         assert_eq!(config.xml_max_body_size, 10 * 1024 * 1024);
         assert_eq!(config.post_object_max_file_size, 2 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn service_builder_installs_custom_clock() {
+        #[derive(Clone, Copy)]
+        struct FixedClock(time::OffsetDateTime);
+
+        impl crate::Clock for FixedClock {
+            fn now_utc(&self) -> Option<time::OffsetDateTime> {
+                Some(self.0)
+            }
+        }
+
+        let now = time::OffsetDateTime::from_unix_timestamp(1_704_067_200).unwrap();
+        let mut builder = S3ServiceBuilder::new(MockS3);
+        builder.set_clock(FixedClock(now));
+        let service = builder.build();
+
+        assert_eq!(service.inner.clock.now_utc(), Some(now));
+    }
+
+    #[tokio::test]
+    async fn service_call_uses_custom_clock_for_presigned_authentication() {
+        struct UnavailableClock;
+
+        impl crate::Clock for UnavailableClock {
+            fn now_utc(&self) -> Option<time::OffsetDateTime> {
+                None
+            }
+        }
+
+        let mut builder = S3ServiceBuilder::new(MockS3);
+        builder.set_auth(crate::auth::SimpleAuth::from_single("AKID", "secret"));
+        builder.set_clock(UnavailableClock);
+        let service = builder.build();
+        let request = http::Request::builder()
+            .method(http::Method::GET)
+            .uri(concat!(
+                "/bucket/object?X-Amz-Algorithm=AWS4-HMAC-SHA256",
+                "&X-Amz-Credential=AKID%2F20240101%2Fus-east-1%2Fs3%2Faws4_request",
+                "&X-Amz-Date=20240101T000000Z",
+                "&X-Amz-Expires=60",
+                "&X-Amz-SignedHeaders=host",
+                "&X-Amz-Signature=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ))
+            .header(http::header::HOST, "s3.example.com")
+            .body(crate::Body::empty())
+            .unwrap();
+
+        let response = service.call(request).await.unwrap();
+        assert_eq!(response.status(), http::StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[test]
